@@ -155,6 +155,15 @@ pub enum AccessType {
     Store,
 }
 
+impl fmt::Display for AccessType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccessType::Load => f.write_str("load"),
+            AccessType::Store => f.write_str("store"),
+        }
+    }
+}
+
 /// Indirection to use instead of a slice to make handling easier
 #[derive(Debug)]
 pub struct MemoryMapping<'a> {

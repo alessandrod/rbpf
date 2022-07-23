@@ -18,11 +18,12 @@ extern crate libc;
 
 use std::{
     fmt::{Debug, Error as FormatterError, Formatter},
-    mem,
+    mem::{self, MaybeUninit},
     ops::{Index, IndexMut},
-    pin::Pin, ptr,
+    pin::Pin, ptr, io::{self, Write}, fs::File, process, sync::{Arc, Mutex},
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use lazy_static::lazy_static;
 
 use crate::{
     elf::Executable,
@@ -33,6 +34,10 @@ use crate::{
     user_error::UserError,
     x86::*,
 };
+
+lazy_static! {
+    static ref JIT_SYMBOLS: Mutex<JitSymbols> = Mutex::new(JitSymbols::new());
+}
 
 const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 4096;
 const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION: usize = 110;
@@ -981,6 +986,8 @@ impl JitCompiler {
         // Have these in front so that the linear search of ANCHOR_TRANSLATE_PC does not terminate early
         self.generate_subroutines::<E, I>()?;
 
+        let addr = unsafe { text_section_base.add(self.offset_in_text_section) };
+        JIT_SYMBOLS.lock().unwrap().start_symbol("__jit_program".to_string(), addr as usize);
         while self.pc * ebpf::INSN_SIZE < program.len() {
             if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION > self.result.text_section.len() {
                 return Err(EbpfError::ExhaustedTextSegment(self.pc));
@@ -1287,6 +1294,8 @@ impl JitCompiler {
         }
         // Bumper so that the linear search of ANCHOR_TRANSLATE_PC can not run off
         self.result.pc_section[self.pc] = unsafe { text_section_base.add(self.offset_in_text_section) } as usize;
+        let addr = unsafe { text_section_base.add(self.offset_in_text_section) };
+        JIT_SYMBOLS.lock().unwrap().end(addr as usize);
 
         // Bumper in case there was no final exit
         if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION > self.result.text_section.len() {
@@ -1299,6 +1308,7 @@ impl JitCompiler {
 
         self.resolve_jumps();
         self.result.seal(self.offset_in_text_section)?;
+        let _ = JIT_SYMBOLS.lock().unwrap().write();
 
         // Delete secrets
         self.environment_stack_key = 0;
@@ -1695,7 +1705,9 @@ impl JitCompiler {
     }
 
     fn set_anchor(&mut self, anchor: usize) {
-        self.anchors[anchor] = unsafe { self.result.text_section.as_ptr().add(self.offset_in_text_section) };
+        let addr = unsafe { self.result.text_section.as_ptr().add(self.offset_in_text_section) };
+        self.anchors[anchor] = addr;
+        JIT_SYMBOLS.lock().unwrap().start_anchor(anchor, addr as usize);
     }
 
     // instruction_length = 5 (Unconditional jump / call)
@@ -1740,6 +1752,92 @@ impl JitCompiler {
                 *offset = callx_unsupported_instruction;
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JitSymbols {
+    symbol_names: [String; ANCHOR_COUNT],
+    current: Option<(String, usize)>,
+    symbols: Vec<(String, usize, usize)>
+}
+
+impl JitSymbols {
+    fn new() -> Self {
+        let mut symbol_names = [(); ANCHOR_COUNT].map(|_| String::new());
+        symbol_names[ANCHOR_EPILOGUE] = "__jit_epilogue".to_string();
+        symbol_names[ANCHOR_TRACE] = "__jit_trace".to_string();
+        symbol_names[ANCHOR_RUST_EXCEPTION] = "__jit_rust_exception".to_string();
+        symbol_names[ANCHOR_CALL_EXCEEDED_MAX_INSTRUCTIONS] = "__jit_call_exceeded_max_instructions".to_string();
+        symbol_names[ANCHOR_EXCEPTION_AT] = "__jit_exception_at".to_string();
+        symbol_names[ANCHOR_CALL_DEPTH_EXCEEDED] = "__jit_call_depth_exceeded".to_string();
+        symbol_names[ANCHOR_CALL_OUTSIDE_TEXT_SEGMENT] = "__jit_call_outside_text_segment".to_string();
+        symbol_names[ANCHOR_DIV_BY_ZERO] = "__jit_div_by_zero".to_string();
+        symbol_names[ANCHOR_DIV_OVERFLOW] = "__jit_div_overflow".to_string();
+        symbol_names[ANCHOR_CALLX_UNSUPPORTED_INSTRUCTION] = "__jit_callx_unsupported_instruction".to_string();
+        symbol_names[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION] = "__jit_call_unsupported_instruction".to_string();
+        symbol_names[ANCHOR_EXIT] = "__jit_exit".to_string();
+        symbol_names[ANCHOR_SYSCALL] = "__jit_syscall".to_string();
+        symbol_names[ANCHOR_BPF_CALL_PROLOGUE] = "__jit_bpf_call_prologue".to_string();
+        symbol_names[ANCHOR_BPF_CALL_REG] = "__jit_bpf_call_reg".to_string();
+        symbol_names[ANCHOR_TRANSLATE_PC] = "__jit_translate_pc".to_string();
+        symbol_names[ANCHOR_TRANSLATE_PC_LOOP] = "__jit_translate_pc_loop".to_string();
+        symbol_names[ANCHOR_MEMORY_ACCESS_VIOLATION] = "__jit_memory_access_violation".to_string();
+
+        for (access_type, len) in &[
+            (AccessType::Load, 1i32),
+            (AccessType::Load, 2i32),
+            (AccessType::Load, 4i32),
+            (AccessType::Load, 8i32),
+            (AccessType::Store, 1i32),
+            (AccessType::Store, 2i32),
+            (AccessType::Store, 4i32),
+            (AccessType::Store, 8i32),
+        ] {
+            let target_offset = len.trailing_zeros() as usize + 4 * (*access_type as usize);
+            symbol_names[ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset] = format!("__jit_xlate_{}_{}", access_type, len)
+        }
+        Self { symbol_names, symbols: Vec::new(), current: None }
+    }
+
+    fn start_symbol(&mut self, sym: String, addr: usize) {
+        if self.current.is_some() {
+            self.end(addr);
+        }
+        self.current = Some((sym, addr));
+    }
+
+    fn end(&mut self, addr: usize) {
+        if let Some((sym, start)) = self.current.take() {
+            self.symbols.push((sym, start, addr.saturating_sub(start)))
+        }
+    }
+
+    fn start_anchor(&mut self, anchor: usize, addr: usize) {
+        if self.current.is_some() {
+            self.end(addr);
+        }
+
+        let name = &self.symbol_names[anchor];
+        if !name.is_empty() {
+            self.start_symbol(name.clone(), addr);
+
+        }
+    }
+
+    fn write(&self) -> Result<(), io::Error> {
+        let mut file = File::create(format!("/tmp/perf-{}.map", process::id()))?;
+        write!(file, "{}", self)
+    }
+}
+
+impl std::fmt::Display for JitSymbols {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        for (name, start, size) in &self.symbols {
+            write!(f, "{:X} {:X} {}\n", start, size, name)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1819,4 +1917,27 @@ mod tests {
             assert!(machine_code_length_per_instruction <= MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION);
         }
     }
+
+    #[test]
+    fn test_jit_symbols() {
+        let mut symbols = JitSymbols::new();
+        assert_eq!(symbols.to_string(), "");
+
+        symbols.start_symbol("__jit_foo".to_string(), 0x10);
+        symbols.end(0x30);
+        assert_eq!(symbols.to_string(), "10 20 __jit_foo\n");
+
+        let mut symbols = JitSymbols::new();
+        symbols.start_anchor(ANCHOR_SYSCALL, 0x10);
+        symbols.end(0x30);
+        assert_eq!(symbols.to_string(), "10 20 __jit_syscall\n");
+
+        let mut symbols = JitSymbols::new();
+        symbols.start_symbol("__jit_zoo".to_string(), 0x10);
+        symbols.start_anchor(ANCHOR_SYSCALL, 0x30);
+        symbols.start_anchor(ANCHOR_TRACE, 0x40);
+        symbols.end(0x100);
+        assert_eq!(symbols.to_string(), "10 20 __jit_zoo\n30 10 __jit_syscall\n40 C0 __jit_trace\n");
+    }
+
 }
