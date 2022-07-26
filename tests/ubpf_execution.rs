@@ -3284,7 +3284,7 @@ fn test_err_syscall_string() {
                 )
             }
         },
-        2
+        16
     );
 }
 

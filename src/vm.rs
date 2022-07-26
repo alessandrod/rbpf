@@ -263,7 +263,7 @@ impl Default for Config {
 }
 
 /// The syscall_context_objects field stores some metadata in the front, thus the entries are shifted
-pub const SYSCALL_CONTEXT_OBJECTS_OFFSET: usize = 4;
+pub const SYSCALL_CONTEXT_OBJECTS_OFFSET: usize = 6;
 
 /// Static constructors for Executable
 impl<E: UserDefinedError, I: 'static + InstructionMeter> Executable<E, I> {

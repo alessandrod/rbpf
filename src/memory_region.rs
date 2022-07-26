@@ -160,30 +160,49 @@ pub enum AccessType {
 pub struct MemoryMapping<'a> {
     /// Mapped memory regions
     regions: Box<[MemoryRegion]>,
+    /// Copy of the regions vm_addr fields to improve cache density
+    dense_keys: Box<[u64]>,
     /// VM configuration
     config: &'a Config,
 }
+
 impl<'a> MemoryMapping<'a> {
+    fn construct_eytzinger_order(
+        &mut self,
+        ascending_regions: &[MemoryRegion],
+        mut in_index: usize,
+        out_index: usize,
+    ) -> usize {
+        if out_index >= self.regions.len() {
+            return in_index;
+        }
+        in_index = self.construct_eytzinger_order(ascending_regions, in_index, 2 * out_index + 1);
+        self.regions[out_index] = ascending_regions[in_index].clone();
+        self.dense_keys[out_index] = ascending_regions[in_index].vm_addr;
+        self.construct_eytzinger_order(ascending_regions, in_index + 1, 2 * out_index + 2)
+    }
+
     /// Creates a new MemoryMapping structure from the given regions
     pub fn new<E: UserDefinedError>(
         mut regions: Vec<MemoryRegion>,
         config: &'a Config,
     ) -> Result<Self, EbpfError<E>> {
         regions.sort();
-        for (index, region) in regions.iter().enumerate() {
-            if region
-                .vm_addr
-                .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-                .unwrap_or(0)
-                != index as u64
-            {
+        for index in 1..regions.len() {
+            let first = &regions[index - 1];
+            let second = &regions[index];
+            if first.vm_addr.saturating_add(first.len) > second.vm_addr {
                 return Err(EbpfError::InvalidMemoryRegion(index));
             }
         }
-        Ok(Self {
-            regions: regions.into_boxed_slice(),
+
+        let mut result = Self {
+            regions: vec![MemoryRegion::default(); regions.len()].into_boxed_slice(),
+            dense_keys: vec![0; regions.len()].into_boxed_slice(),
             config,
-        })
+        };
+        result.construct_eytzinger_order(&regions, 0, 0);
+        Ok(result)
     }
 
     /// Given a list of regions translate from virtual machine to host address
@@ -193,17 +212,21 @@ impl<'a> MemoryMapping<'a> {
         vm_addr: u64,
         len: u64,
     ) -> Result<u64, EbpfError<E>> {
-        let index = vm_addr
-            .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
-        if (1..self.regions.len()).contains(&index) {
-            let region = &self.regions[index];
-            if access_type == AccessType::Load || region.is_writable {
-                if let Ok(host_addr) = region.vm_to_host::<E>(vm_addr, len as u64) {
-                    return Ok(host_addr);
-                }
+        let mut index = 1;
+        while index <= self.dense_keys.len() {
+            index = (index << 1) + (self.dense_keys[index - 1] <= vm_addr) as usize;
+        }
+        index >>= index.trailing_zeros() + 1;
+        if index == 0 {
+            return self.generate_access_violation(access_type, vm_addr, len);
+        }
+        let region = &self.regions[index - 1];
+        if access_type == AccessType::Load || region.is_writable {
+            if let Ok(host_addr) = region.vm_to_host::<E>(vm_addr, len as u64) {
+                return Ok(host_addr);
             }
         }
+
         self.generate_access_violation(access_type, vm_addr, len)
     }
 
@@ -257,21 +280,13 @@ impl<'a> MemoryMapping<'a> {
         index: usize,
         region: MemoryRegion,
     ) -> Result<(), EbpfError<E>> {
-        if index >= self.regions.len() {
-            return Err(EbpfError::InvalidMemoryRegion(index));
-        }
-        let begin_index = region
-            .vm_addr
-            .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
-        let end_index = region
-            .vm_addr
-            .saturating_add(region.len.saturating_sub(1))
-            .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
-            .unwrap_or(0) as usize;
-        if begin_index != index || end_index != index {
-            return Err(EbpfError::InvalidMemoryRegion(index));
-        }
+        // if index < self.regions.len() - 1
+        //     && self.regions[index].vm_addr.saturating_add(region.len)
+        //         > self.regions[index + 1].vm_addr
+        // {
+        //     return Err(EbpfError::InvalidMemoryRegion(index));
+        // }
+
         self.regions[index] = region;
         Ok(())
     }
