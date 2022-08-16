@@ -2,7 +2,7 @@
 //! Call frame handler
 
 use crate::{
-    aligned_memory::AlignedMemory,
+    aligned_memory::{AlignedMemory, AlignedSlice},
     ebpf::{ELF_INSN_DUMP_OFFSET, HOST_ALIGN, MM_STACK_START, SCRATCH_REGS},
     error::{EbpfError, UserDefinedError},
     memory_region::MemoryRegion,
@@ -20,10 +20,10 @@ struct CallFrame {
 /// When BPF calls a function other then a `syscall` it expect the new
 /// function to be called in its own frame.  CallFrames manages
 /// call frames
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CallFrames<'a> {
     config: &'a Config,
-    stack: AlignedMemory<{ HOST_ALIGN }>,
+    stack: AlignedSlice<'a, { HOST_ALIGN }, &'a mut [u8]>,
     stack_ptr: u64,
     frame_index: usize,
     frame_index_max: usize,
@@ -31,9 +31,11 @@ pub struct CallFrames<'a> {
 }
 impl<'a> CallFrames<'a> {
     /// New call frame, depth indicates maximum call depth
-    pub fn new(config: &'a Config) -> Self {
+    pub fn new(config: &'a Config, stack: AlignedSlice<'a, { HOST_ALIGN }, &'a mut [u8]>) -> Self {
         let stack_len = config.stack_size();
-        let stack = AlignedMemory::zero_filled(stack_len);
+        if stack.len() != stack_len {
+            panic!("invalid stack len");
+        }
 
         let mut frames = CallFrames {
             config,
@@ -69,7 +71,7 @@ impl<'a> CallFrames<'a> {
     /// Get stack memory region
     pub fn get_memory_region(&mut self) -> MemoryRegion {
         MemoryRegion::new_writable_gapped(
-            self.stack.as_slice_mut(),
+            &mut self.stack,
             MM_STACK_START,
             if !self.config.dynamic_stack_frames && self.config.enable_stack_frame_gaps {
                 self.config.stack_frame_size as u64
@@ -177,6 +179,8 @@ impl<'a> CallFrames<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryInto;
+
     use super::*;
     use crate::user_error::UserError;
 
@@ -192,7 +196,8 @@ mod tests {
                 dynamic_stack_frames,
                 ..Config::default()
             };
-            let mut frames = CallFrames::new(&config);
+            let mut stack = AlignedMemory::<HOST_ALIGN>::zero_filled(config.stack_size());
+            let mut frames = CallFrames::new(&config, stack.as_slice_mut().try_into().unwrap());
             let mut frame_ptrs: Vec<u64> = Vec::new();
 
             for i in 0..config.max_call_depth - 1 {
@@ -250,7 +255,8 @@ mod tests {
             dynamic_stack_frames: true,
             ..Config::default()
         };
-        let mut frames = CallFrames::new(&config);
+        let mut stack = AlignedMemory::<HOST_ALIGN>::zero_filled(config.stack_size());
+        let mut frames = CallFrames::new(&config, stack.as_slice_mut().try_into().unwrap());
         frames.resize_stack(-(MM_STACK_START as i64 + config.stack_size() as i64));
         assert_eq!(frames.get_stack_ptr(), 0);
 
@@ -266,7 +272,8 @@ mod tests {
             dynamic_stack_frames: true,
             ..Config::default()
         };
-        let mut frames = CallFrames::new(&config);
+        let mut stack = AlignedMemory::<HOST_ALIGN>::zero_filled(config.stack_size());
+        let mut frames = CallFrames::new(&config, stack.as_slice_mut().try_into().unwrap());
         frames.resize_stack(-(MM_STACK_START as i64 + config.stack_size() as i64));
         assert_eq!(frames.get_stack_ptr(), 0);
 

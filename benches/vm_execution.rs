@@ -9,7 +9,9 @@
 extern crate solana_rbpf;
 extern crate test;
 
+use jemallocator::Jemalloc;
 use solana_rbpf::{
+    aligned_memory::AlignedMemory,
     ebpf,
     elf::Executable,
     memory_region::MemoryRegion,
@@ -17,8 +19,11 @@ use solana_rbpf::{
     vm::{Config, EbpfVm, SyscallRegistry, TestInstructionMeter, VerifiedExecutable},
 };
 use std::{fs::File, io::Read};
-use test::Bencher;
+use test::{black_box, Bencher};
 use test_utils::TautologyVerifier;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[bench]
 fn bench_init_interpreter_execution(bencher: &mut Bencher) {
@@ -253,4 +258,24 @@ fn bench_jit_vs_interpreter_call_depth_dynamic(bencher: &mut Bencher) {
         176130,
         &mut [],
     );
+}
+
+#[bench]
+fn bench_aligned_memory_1k(bencher: &mut Bencher) {
+    let mut m = Some(
+        (0..1024)
+            .map(|_| AlignedMemory::<8>::zero_filled(1024))
+            .collect::<Vec<_>>(),
+    );
+    bencher.bench(move |_| {
+        m.take();
+    });
+}
+
+#[bench]
+fn bench_aligned_memory_1M(bencher: &mut Bencher) {
+    let mut m = Some(AlignedMemory::<8>::zero_filled(1024 * 1024));
+    bencher.bench(move |_| {
+        m.take();
+    });
 }

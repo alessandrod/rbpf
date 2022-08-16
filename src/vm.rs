@@ -13,9 +13,10 @@
 //! Virtual machine for eBPF programs.
 
 use crate::{
+    aligned_memory::AlignedSlice,
     call_frames::CallFrames,
     disassembler::disassemble_instruction,
-    ebpf,
+    ebpf::{self, HOST_ALIGN},
     elf::Executable,
     error::{EbpfError, UserDefinedError},
     interpreter::Interpreter,
@@ -509,11 +510,12 @@ impl<'a, V: Verifier, E: UserDefinedError, I: InstructionMeter> EbpfVm<'a, V, E,
     pub fn new(
         verified_executable: &'a VerifiedExecutable<V, E, I>,
         heap_region: &mut [u8],
+        stack: AlignedSlice<'a, { HOST_ALIGN }, &'a mut [u8]>,
         additional_regions: Vec<MemoryRegion>,
     ) -> Result<EbpfVm<'a, V, E, I>, EbpfError<E>> {
         let executable = verified_executable.get_executable();
         let config = executable.get_config();
-        let mut stack = CallFrames::new(config);
+        let mut stack = CallFrames::new(config, stack);
         let regions: Vec<MemoryRegion> = vec![
             MemoryRegion::new_readonly(&[], 0),
             verified_executable.get_executable().get_ro_region(),

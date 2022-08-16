@@ -23,6 +23,7 @@ extern crate solana_rbpf;
 extern crate thiserror;
 
 use solana_rbpf::{
+    aligned_memory::AlignedMemory,
     assembler::assemble,
     ebpf,
     elf::Executable,
@@ -31,7 +32,7 @@ use solana_rbpf::{
     verifier::{RequisiteVerifier, Verifier, VerifierError},
     vm::{Config, EbpfVm, SyscallRegistry, TestInstructionMeter, VerifiedExecutable},
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, convert::TryInto};
 use test_utils::TautologyVerifier;
 use thiserror::Error;
 
@@ -65,9 +66,16 @@ fn test_verifier_success() {
             executable,
         )
         .unwrap();
+    let mut stack = AlignedMemory::<{ ebpf::HOST_ALIGN }>::zero_filled(
+        verified_executable
+            .get_executable()
+            .get_config()
+            .stack_size(),
+    );
     let _vm = EbpfVm::<TautologyVerifier, UserError, TestInstructionMeter>::new(
         &verified_executable,
         &mut [],
+        stack.as_slice_mut().try_into().unwrap(),
         Vec::new(),
     )
     .unwrap();

@@ -22,6 +22,8 @@ extern crate solana_rbpf;
 extern crate test_utils;
 
 use solana_rbpf::{
+    aligned_memory::AlignedMemory,
+    ebpf,
     elf::Executable,
     fuzz::fuzz,
     syscalls::{BpfSyscallContext, BpfSyscallString, BpfSyscallU64},
@@ -31,7 +33,7 @@ use solana_rbpf::{
         Config, EbpfVm, SyscallObject, SyscallRegistry, TestInstructionMeter, VerifiedExecutable,
     },
 };
-use std::{fs::File, io::Read};
+use std::{convert::TryInto, fs::File, io::Read};
 
 // The following two examples have been compiled from C with the following command:
 //
@@ -140,9 +142,16 @@ fn test_fuzz_execute() {
                     TestInstructionMeter,
                 >::from_executable(executable)
                 {
+                    let mut stack = AlignedMemory::<{ ebpf::HOST_ALIGN }>::zero_filled(
+                        verified_executable
+                            .get_executable()
+                            .get_config()
+                            .stack_size(),
+                    );
                     let mut vm = EbpfVm::<RequisiteVerifier, UserError, TestInstructionMeter>::new(
                         &verified_executable,
                         &mut [],
+                        stack.as_slice_mut().try_into().unwrap(),
                         Vec::new(),
                     )
                     .unwrap();

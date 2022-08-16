@@ -1,7 +1,15 @@
 #![allow(clippy::integer_arithmetic)]
 //! Aligned memory
 
-use std::mem;
+use std::{
+    convert::TryFrom,
+    io::Write,
+    marker::PhantomData,
+    mem,
+    ops::{Deref, DerefMut},
+};
+
+use byteorder::WriteBytesExt;
 
 /// Provides u8 slices at a specified alignment
 #[derive(Debug, PartialEq, Eq)]
@@ -159,6 +167,79 @@ pub fn is_memory_aligned(data: &[u8], align: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Memory is not aligned.
+#[derive(Debug)]
+pub struct UnalignedError;
+
+/// A borrowed slice of bytes aligned to the given alignment.
+#[derive(Debug)]
+pub struct AlignedSlice<'a, const ALIGN: usize, T> {
+    data: T,
+    _a: &'a PhantomData<()>,
+}
+
+impl<'a, const ALIGN: usize, T: Deref<Target = [u8]> + 'a> Deref for AlignedSlice<'a, ALIGN, T> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<'a, const ALIGN: usize, T: DerefMut<Target = [u8]> + 'a> DerefMut
+    for AlignedSlice<'a, ALIGN, T>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+impl<'a, const ALIGN: usize> TryFrom<&'a [u8]> for AlignedSlice<'a, ALIGN, &'a [u8]> {
+    type Error = UnalignedError;
+
+    fn try_from(data: &'a [u8]) -> Result<Self, Self::Error> {
+        if !ALIGN.is_power_of_two() {
+            return Err(UnalignedError);
+        }
+        if is_memory_aligned(data, ALIGN) {
+            Ok(AlignedSlice {
+                data,
+                _a: &PhantomData,
+            })
+        } else {
+            Err(UnalignedError)
+        }
+    }
+}
+
+impl<'a, const ALIGN: usize> TryFrom<&'a mut [u8]> for AlignedSlice<'a, ALIGN, &'a mut [u8]> {
+    type Error = UnalignedError;
+
+    fn try_from(data: &'a mut [u8]) -> Result<Self, Self::Error> {
+        if !ALIGN.is_power_of_two() {
+            return Err(UnalignedError);
+        }
+        if is_memory_aligned(data, ALIGN) {
+            Ok(AlignedSlice {
+                data,
+                _a: &PhantomData,
+            })
+        } else {
+            Err(UnalignedError)
+        }
+    }
+}
+
+impl<'a, const ALIGN: usize> Write for AlignedSlice<'a, ALIGN, &'a mut [u8]> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.data.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.data.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +276,19 @@ mod tests {
     fn test_aligned_memory() {
         do_test::<1>();
         do_test::<32768>();
+    }
+
+    #[test]
+    fn test_aligned_slice() {
+        let mut m = AlignedMemory::<8>::zero_filled(10);
+        assert!(AlignedSlice::<8, _>::try_from(m.as_slice()).is_ok());
+        assert!(AlignedSlice::<8, _>::try_from(&m.as_slice()[1..]).is_err());
+        assert!(AlignedSlice::<8, _>::try_from(&m.as_slice()[7..]).is_err());
+        assert!(AlignedSlice::<8, _>::try_from(&m.as_slice()[8..]).is_ok());
+
+        let mut s = AlignedSlice::<8, _>::try_from(&mut m.as_slice_mut()[8..]).unwrap();
+        s.write_u8(42).unwrap();
+        assert_eq!(s.len(), 1);
+        eprintln!("{:?}", m.as_slice());
     }
 }

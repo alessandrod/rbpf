@@ -15,6 +15,7 @@ use byteorder::{ByteOrder, LittleEndian};
 #[cfg(all(not(windows), target_arch = "x86_64"))]
 use rand::{rngs::SmallRng, RngCore, SeedableRng};
 use solana_rbpf::{
+    aligned_memory::AlignedMemory,
     assembler::assemble,
     ebpf,
     elf::{register_bpf_function, ElfError, Executable},
@@ -27,7 +28,7 @@ use solana_rbpf::{
         Config, EbpfVm, SyscallObject, SyscallRegistry, TestInstructionMeter, VerifiedExecutable,
     },
 };
-use std::{collections::BTreeMap, fs::File, io::Read};
+use std::{collections::BTreeMap, convert::TryInto, fs::File, io::Read};
 use test_utils::{PROG_TCP_PORT_80, TCP_SACK_ASM, TCP_SACK_MATCH, TCP_SACK_NOMATCH};
 
 macro_rules! test_interpreter_and_jit {
@@ -53,7 +54,19 @@ macro_rules! test_interpreter_and_jit {
             let mut mem = $mem;
             let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
 
-            let mut vm = EbpfVm::new(&verified_executable, &mut [], vec![mem_region]).unwrap();
+            let mut stack = AlignedMemory::<{ ebpf::HOST_ALIGN }>::zero_filled(
+                verified_executable
+                    .get_executable()
+                    .get_config()
+                    .stack_size(),
+            );
+            let mut vm = EbpfVm::new(
+                &verified_executable,
+                &mut [],
+                stack.as_slice_mut().try_into().unwrap(),
+                vec![mem_region],
+            )
+            .unwrap();
             test_interpreter_and_jit!(bind, vm, $syscall_context);
             let result = vm.execute_program_interpreted(&mut TestInstructionMeter {
                 remaining: $expected_instruction_count,
