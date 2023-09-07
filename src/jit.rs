@@ -1259,9 +1259,9 @@ impl<'a, V: Verifier, C: ContextObject> JitCompiler<'a, V, C> {
 
         // Routine for allocating errors
         self.set_anchor(ANCHOR_ALLOCATE_EXCEPTION);
-        unsafe fn allocate_error(result: &mut ProgramResult) -> *mut EbpfError {
+        unsafe fn allocate_error(result: *mut ProgramResult) -> *mut EbpfError {
             let err_ptr = std::alloc::alloc(std::alloc::Layout::new::<EbpfError>()) as *mut EbpfError;
-            *result = ProgramResult::Err(Box::from_raw(err_ptr));
+            result.write(ProgramResult::Err(Box::from_raw(err_ptr)));
             err_ptr
         }
         self.emit_ins(X86Instruction::lea(OperandSize::S64, RBP, R10, Some(X86IndirectAccess::Offset(self.slot_on_environment_stack(RuntimeEnvironmentSlot::ProgramResult)))));
