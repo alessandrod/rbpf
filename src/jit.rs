@@ -25,6 +25,7 @@ use rand::{
 };
 use std::{convert::TryFrom, fmt::Debug, mem, ptr};
 
+use crate::jit_debug::{build_jit_code_meta, JitDebug, JitHostSymbol};
 use crate::{
     ebpf::{self, FIRST_SCRATCH_REG, FRAME_PTR_REG, INSN_SIZE, SCRATCH_REGS},
     elf::Executable,
@@ -65,6 +66,61 @@ pub struct JitProgram {
     /// Before sealing this is the full code capacity; after sealing
     /// this is the emitted code.
     text_section: &'static mut [u8],
+    #[cfg(feature = "jit-enable-host-stack-frames")]
+    host_stack_frame_entry: usize,
+    jit_debug: Option<JitDebug>,
+}
+
+fn anchor_name(index: usize) -> String {
+    match index {
+        ANCHOR_TRACE => "ANCHOR_TRACE".to_string(),
+        ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS => {
+            "ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS".to_string()
+        }
+        ANCHOR_EPILOGUE => "ANCHOR_EPILOGUE".to_string(),
+        ANCHOR_THROW_EXCEPTION_UNCHECKED => "ANCHOR_THROW_EXCEPTION_UNCHECKED".to_string(),
+        ANCHOR_EXIT => "ANCHOR_EXIT".to_string(),
+        ANCHOR_THROW_EXCEPTION => "ANCHOR_THROW_EXCEPTION".to_string(),
+        ANCHOR_CALL_DEPTH_EXCEEDED => "ANCHOR_CALL_DEPTH_EXCEEDED".to_string(),
+        ANCHOR_CALL_REG_OUTSIDE_TEXT_SEGMENT => "ANCHOR_CALL_REG_OUTSIDE_TEXT_SEGMENT".to_string(),
+        ANCHOR_DIV_BY_ZERO => "ANCHOR_DIV_BY_ZERO".to_string(),
+        ANCHOR_DIV_OVERFLOW => "ANCHOR_DIV_OVERFLOW".to_string(),
+        ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION => {
+            "ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION".to_string()
+        }
+        ANCHOR_CALL_UNSUPPORTED_INSTRUCTION => "ANCHOR_CALL_UNSUPPORTED_INSTRUCTION".to_string(),
+        ANCHOR_EXTERNAL_FUNCTION_CALL => "ANCHOR_EXTERNAL_FUNCTION_CALL".to_string(),
+        ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE => {
+            "ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE".to_string()
+        }
+        ANCHOR_INTERNAL_FUNCTION_CALL_REG => "ANCHOR_INTERNAL_FUNCTION_CALL_REG".to_string(),
+        ANCHOR_HOST_STACK_FRAME => "ANCHOR_HOST_STACK_FRAME".to_string(),
+        ANCHOR_ENTRYPOINT => "ANCHOR_ENTRYPOINT".to_string(),
+        index if index >= ANCHOR_TRANSLATE_MEMORY_ADDRESS => {
+            let target_offset = index - ANCHOR_TRANSLATE_MEMORY_ADDRESS;
+            for (anchor_base, len) in &[
+                (0usize, 1i32),
+                (0usize, 2i32),
+                (0usize, 4i32),
+                (0usize, 8i32),
+                (4usize, 1i32),
+                (4usize, 2i32),
+                (4usize, 4i32),
+                (4usize, 8i32),
+                (8usize, 1i32),
+                (8usize, 2i32),
+                (8usize, 4i32),
+                (8usize, 8i32),
+            ] {
+                let offset = *anchor_base + len.trailing_zeros() as usize;
+                if offset == target_offset {
+                    return format!("ANCHOR_TRANSLATE_MEMORY_ADDRESS_{}_{}", anchor_base, len);
+                }
+            }
+            format!("ANCHOR_TRANSLATE_MEMORY_ADDRESS_{}", target_offset)
+        }
+        _ => format!("ANCHOR_{index}"),
+    }
 }
 
 impl JitProgram {
@@ -90,6 +146,9 @@ impl JitProgram {
                     raw.add(pc_loc_table_size),
                     over_allocated_code_size,
                 ),
+                jit_debug: None,
+                #[cfg(feature = "jit-enable-host-stack-frames")]
+                host_stack_frame_entry: 0,
             })
         }
     }
@@ -134,9 +193,12 @@ impl JitProgram {
         unsafe {
             let instruction_meter =
                 (vm.previous_instruction_meter as i64).wrapping_add(registers[11] as i64);
+            #[cfg(not(feature = "jit-enable-host-stack-frames"))]
             let entrypoint = &self.text_section
                 [self.pc_section[registers[11] as usize] as usize & (i32::MAX as u32 as usize)]
                 as *const u8;
+            #[cfg(feature = "jit-enable-host-stack-frames")]
+            let entrypoint = &self.text_section[self.host_stack_frame_entry] as *const u8;
             let host_stack_pointer = &raw mut vm.host_stack_pointer;
             let vm = vm.encrypted_host_address();
             macro_rules! stmt_expr_attribute_asm {
@@ -197,6 +259,9 @@ impl JitProgram {
 
 impl Drop for JitProgram {
     fn drop(&mut self) {
+        if let Some(mut jit_debug) = self.jit_debug.take() {
+            jit_debug.on_code_unload();
+        }
         unsafe {
             free_pages_pooled(
                 self.pc_section.as_mut_ptr().cast::<u8>(),
@@ -235,6 +300,8 @@ const ANCHOR_CALL_UNSUPPORTED_INSTRUCTION: usize = 11;
 const ANCHOR_EXTERNAL_FUNCTION_CALL: usize = 12;
 const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 13;
 const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
+const ANCHOR_HOST_STACK_FRAME: usize = 15;
+const ANCHOR_ENTRYPOINT: usize = 16;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
 const ANCHOR_COUNT: usize = 34; // Update me when adding or removing anchors
 
@@ -258,6 +325,16 @@ const REGISTER_PTR_TO_VM: X86Register = ARGUMENT_REGISTERS[0];
 const REGISTER_INSTRUCTION_METER: X86Register = CALLER_SAVED_REGISTERS[7];
 /// R11: Scratch register
 const REGISTER_SCRATCH: X86Register = CALLER_SAVED_REGISTERS[8];
+
+#[cfg(feature = "jit-enable-host-stack-frames")]
+const ADDRESS_TRANSLATION_VALUE_SLOT_OFFSET: i32 = -104;
+#[cfg(not(feature = "jit-enable-host-stack-frames"))]
+const ADDRESS_TRANSLATION_VALUE_SLOT_OFFSET: i32 = -96;
+
+#[cfg(feature = "jit-enable-host-stack-frames")]
+const ADDRESS_TRANSLATION_VALUE_SLOT_OFFSET_PRE_CALL: i32 = -80;
+#[cfg(not(feature = "jit-enable-host-stack-frames"))]
+const ADDRESS_TRANSLATION_VALUE_SLOT_OFFSET_PRE_CALL: i32 = -80;
 
 /// Bit width of an instruction operand
 #[derive(Copy, Clone, Debug)]
@@ -347,6 +424,8 @@ pub struct JitCompiler<'a, C: ContextObject> {
     result: JitProgram,
     text_section_jumps: Vec<Jump>,
     anchors: [*const u8; ANCHOR_COUNT],
+    anchor_ranges: [AnchorRange; ANCHOR_COUNT],
+    last_anchor: Option<usize>,
     offset_in_text_section: usize,
     executable: &'a Executable<C>,
     program: &'a [u8],
@@ -360,6 +439,25 @@ pub struct JitCompiler<'a, C: ContextObject> {
     immediate_value_key: i64,
     diversification_rng: SmallRng,
     stopwatch_is_active: bool,
+    function_entry_bits: Vec<u64>,
+    function_entry_offsets: Vec<u32>,
+}
+
+#[derive(Copy, Clone)]
+struct AnchorRange {
+    start: usize,
+    end: usize,
+}
+
+impl AnchorRange {
+    const UNSET: usize = usize::MAX;
+
+    const fn new() -> Self {
+        Self {
+            start: Self::UNSET,
+            end: Self::UNSET,
+        }
+    }
 }
 
 #[rustfmt::skip]
@@ -397,10 +495,35 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let mut diversification_rng = SmallRng::from_rng(thread_rng()).map_err(|_| EbpfError::JitNotCompiled)?;
         let immediate_value_key = diversification_rng.gen::<i64>();
 
+        let mut function_entry_bits = vec![0u64; (pc + 63) / 64];
+        let mut mark_function_entry = |target_pc: usize| {
+            if target_pc < pc {
+                let word = target_pc / 64;
+                let bit = target_pc % 64;
+                function_entry_bits[word] |= 1u64 << bit;
+            }
+        };
+        mark_function_entry(executable.get_entrypoint_instruction_offset());
+        for (_key, (_name, target_pc)) in executable.get_function_registry().iter() {
+            mark_function_entry(target_pc);
+        }
+        if executable.get_sbpf_version().static_syscalls() {
+            for pc in 0..pc {
+                let insn = ebpf::get_insn_unchecked(program, pc);
+                if insn.opc == ebpf::CALL_IMM && insn.src == 1 {
+                    let target_pc = (pc as i64).saturating_add(insn.imm).saturating_add(1);
+                    if target_pc >= 0 {
+                        mark_function_entry(target_pc as usize);
+                    }
+                }
+            }
+        }
         Ok(Self {
             result: JitProgram::new(pc, code_length_estimate)?,
             text_section_jumps: vec![],
             anchors: [std::ptr::null(); ANCHOR_COUNT],
+            anchor_ranges: [AnchorRange::new(); ANCHOR_COUNT],
+            last_anchor: None,
             offset_in_text_section: 0,
             executable,
             program_vm_addr,
@@ -414,6 +537,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             immediate_value_key,
             diversification_rng,
             stopwatch_is_active: false,
+            function_entry_bits,
+            function_entry_offsets: vec![u32::MAX; pc],
         })
     }
 
@@ -439,6 +564,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // Regular instruction meter checkpoints to prevent long linear runs from exceeding their budget
             if self.last_instruction_meter_validation_pc + self.config.instruction_meter_checkpoint_distance <= self.pc {
                 self.emit_validate_instruction_count(Some(self.pc));
+            }
+
+            if self.is_function_entry_pc(self.pc) {
+                self.function_entry_offsets[self.pc] = self.offset_in_text_section as u32;
             }
 
             if self.config.enable_register_tracing {
@@ -861,6 +990,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, REGISTER_PTR_TO_VM, 1, Some(call_depth_access))); // env.call_depth -= 1;
 
                     // and return
+                    #[cfg(feature = "jit-enable-host-stack-frames")]
+                    self.emit_ins(X86Instruction::pop(RBP));
                     self.emit_ins(X86Instruction::return_near());
                 },
 
@@ -881,7 +1012,33 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         self.resolve_jumps();
         self.result.seal(self.offset_in_text_section)?;
+        if JitDebug::enabled() {
+            let host_symbols = self.collect_anchor_symbols(self.result.text_section.len());
+            let meta = build_jit_code_meta(
+                self.executable,
+                self.program,
+                self.result.text_section.as_ptr(),
+                self.result.text_section.len(),
+                host_symbols,
+                self.function_entry_offsets,
+            );
+            let mut debug = JitDebug::new(meta);
+            debug.on_code_load(
+                self.result.text_section,
+                self.result.pc_section,
+                self.program,
+            );
+            self.result.jit_debug = Some(debug);
+        }
         Ok(self.result)
+    }
+
+    fn is_function_entry_pc(&self, pc: usize) -> bool {
+        let word = pc / 64;
+        if word >= self.function_entry_bits.len() {
+            return false;
+        }
+        ((self.function_entry_bits[word] >> (pc % 64)) & 1) != 0
     }
 
     fn should_sanitize_constant(&self, value: i64) -> bool {
@@ -905,6 +1062,58 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     fn slot_in_vm(&self, slot: RuntimeEnvironmentSlot) -> i32 {
         (slot as i32) - self.runtime_environment_key
+    }
+
+    fn collect_anchor_symbols(&self, text_len: usize) -> Vec<JitHostSymbol> {
+        if text_len == 0 {
+            return Vec::new();
+        }
+        let base = self.result.text_section.as_ptr();
+        let mut ranges: Vec<(usize, usize, usize)> = self
+            .anchors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ptr)| {
+                if ptr.is_null() {
+                    return None;
+                }
+                let mut start = self.anchor_ranges[index].start;
+                if start == AnchorRange::UNSET {
+                    let offset = unsafe { ptr.offset_from(base) as isize };
+                    if offset < 0 {
+                        return None;
+                    }
+                    start = offset as usize;
+                }
+                let end = self.anchor_ranges[index].end;
+                Some((index, start, end))
+            })
+            .collect();
+        ranges.sort_by_key(|(_, start, _)| *start);
+
+        let mut symbols = Vec::new();
+        for i in 0..ranges.len() {
+            let (index, start, end_hint) = ranges[i];
+            if start >= text_len {
+                continue;
+            }
+            let end = if end_hint != AnchorRange::UNSET {
+                end_hint.min(text_len)
+            } else if i + 1 < ranges.len() {
+                ranges[i + 1].1.min(text_len)
+            } else {
+                text_len
+            };
+            if end <= start {
+                continue;
+            }
+            symbols.push(JitHostSymbol {
+                name: anchor_name(index),
+                host_start: start as u64,
+                host_end: end as u64,
+            });
+        }
+        symbols
     }
 
     pub(crate) fn emit<T>(&mut self, data: T) {
@@ -1129,7 +1338,35 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
     }
 
+    fn emit_rust_call_with_host_stack_frame(
+        &mut self,
+        target: Value,
+        arguments: &[Argument],
+        result_reg: Option<X86Register>,
+    ) {
+        self.emit_rust_call(target, arguments, result_reg);
+    }
+
+    fn emit_host_stack_frame_prologue(&mut self) {
+        #[cfg(feature = "jit-enable-host-stack-frames")]
+        {
+            self.emit_ins(X86Instruction::push(RBP, None));
+            self.emit_ins(X86Instruction::mov(OperandSize::S64, RSP, RBP));
+        }
+    }
+
+    fn emit_host_stack_frame_epilogue(&mut self) {
+        #[cfg(feature = "jit-enable-host-stack-frames")]
+        {
+            self.emit_ins(X86Instruction::pop(RBP));
+        }
+    }
+
     fn emit_internal_call(&mut self, dst: Value) {
+        // The callee pushes a host frame pointer in addition to its return address.
+        // Pad the saved guest registers so nested calls preserve stack alignment.
+        #[cfg(feature = "jit-enable-host-stack-frames")]
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8, None));
         // Store PC in case the bounds check fails
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
         self.last_instruction_meter_validation_pc = self.pc;
@@ -1152,8 +1389,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 } else {
                     self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, target_pc));
                 }
-                let jump_offset = self.relative_to_target_pc(target_pc as usize, 5);
-                self.emit_ins(X86Instruction::call_immediate(jump_offset));
+                #[cfg(feature = "jit-enable-host-stack-frames")]
+                {
+                    // Keep the target PC in REGISTER_SCRATCH for invalid-instruction errors.
+                    self.emit_ins(X86Instruction::push(REGISTER_MAP[0], None));
+                    let offset = self.relative_to_target_pc(target_pc as usize, 7);
+                    self.emit_ins(X86Instruction::lea(OperandSize::S64, RAX, REGISTER_MAP[0], Some(X86IndirectAccess::RipRelative(offset))));
+                    self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_MAP[0], RSP, X86IndirectAccess::OffsetIndexShift(-24, RSP, 0)));
+                    self.emit_ins(X86Instruction::pop(REGISTER_MAP[0]));
+                    self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(ANCHOR_HOST_STACK_FRAME, 5)));
+                }
+                #[cfg(not(feature = "jit-enable-host-stack-frames"))]
+                {
+                    let jump_offset = self.relative_to_target_pc(target_pc as usize, 5);
+                    self.emit_ins(X86Instruction::call_immediate(jump_offset));
+                }
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1168,6 +1418,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for reg in REGISTER_MAP.iter().skip(FIRST_SCRATCH_REG).take(SCRATCH_REGS).rev() {
             self.emit_ins(X86Instruction::pop(*reg));
         }
+        #[cfg(feature = "jit-enable-host-stack-frames")]
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8, None));
     }
 
     /// Emits a syscall handler invocation
@@ -1180,7 +1432,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     fn emit_address_translation(&mut self, dst: Option<X86Register>, vm_addr: Value, len: u64, value: Option<Value>) {
         debug_assert_ne!(dst.is_some(), value.is_some());
-        let value_stack_slot = X86IndirectAccess::OffsetIndexShift(-96, RSP, 0);
+        let value_stack_slot = X86IndirectAccess::OffsetIndexShift(ADDRESS_TRANSLATION_VALUE_SLOT_OFFSET, RSP, 0);
 
         if self.config.enable_address_translation {
             match value {
@@ -1221,7 +1473,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             };
             let anchor = ANCHOR_TRANSLATE_MEMORY_ADDRESS + anchor_base + len.trailing_zeros() as usize;
             // store self.pc in the first stack slot of the anchor
-            self.emit_ins(X86Instruction::store_immediate(OperandSize::S64, RSP, X86IndirectAccess::OffsetIndexShift(-16, RSP, 0), self.pc as i64));
+            #[cfg(feature = "jit-enable-host-stack-frames")]
+            self.emit_ins(X86Instruction::store_immediate( OperandSize::S64, RSP, X86IndirectAccess::OffsetIndexShift(-24, RSP, 0), self.pc as i64));
+            #[cfg(not(feature = "jit-enable-host-stack-frames"))]
+            self.emit_ins(X86Instruction::store_immediate( OperandSize::S64, RSP, X86IndirectAccess::OffsetIndexShift(-16, RSP, 0), self.pc as i64));
             self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(anchor, 5)));
             if let Some(dst) = dst {
                 self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, dst));
@@ -1430,6 +1685,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Routine for instruction tracing
         if self.config.enable_register_tracing {
             self.set_anchor(ANCHOR_TRACE);
+            self.emit_host_stack_frame_prologue();
             // Save registers on stack
             self.emit_ins(X86Instruction::push(REGISTER_SCRATCH, None));
             for reg in REGISTER_MAP.iter().rev() {
@@ -1437,7 +1693,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
             self.emit_ins(X86Instruction::mov(OperandSize::S64, RSP, REGISTER_MAP[0]));
             self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, - 8 * 3, None)); // RSP -= 8 * 3;
-            self.emit_rust_call(Value::Constant64(Vec::<crate::static_analysis::RegisterTraceEntry>::push as *const u8 as i64, false), &[
+            self.emit_rust_call_with_host_stack_frame(Value::Constant64(Vec::<crate::static_analysis::RegisterTraceEntry>::push as *const u8 as i64, false), &[
                 Argument { index: 1, value: Value::Register(REGISTER_MAP[0]) }, // registers
                 Argument { index: 0, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::RegisterTrace), false) },
             ], None);
@@ -1446,6 +1702,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.emit_ins(X86Instruction::pop(REGISTER_MAP[0]));
             self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8 * (REGISTER_MAP.len() - 1) as i64, None)); // RSP += 8 * (REGISTER_MAP.len() - 1);
             self.emit_ins(X86Instruction::pop(REGISTER_SCRATCH));
+            self.emit_host_stack_frame_epilogue();
             self.emit_ins(X86Instruction::return_near());
         }
 
@@ -1537,6 +1794,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         // Routine for external functions
         self.set_anchor(ANCHOR_EXTERNAL_FUNCTION_CALL);
+        self.emit_host_stack_frame_prologue();
         self.emit_ins(X86Instruction::push_immediate(OperandSize::S64, -1)); // Used as PC value in error case, acts as stack padding otherwise
         if self.config.enable_instruction_meter {
             self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::DueInsnCount)))); // *DueInsnCount = REGISTER_INSTRUCTION_METER;
@@ -1556,6 +1814,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Test if result indicates that an error occured
         self.emit_result_is_err(REGISTER_SCRATCH);
         self.emit_ins(X86Instruction::pop(REGISTER_SCRATCH));
+        self.emit_host_stack_frame_epilogue();
         self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_EPILOGUE, 6)));
         // Store Ok value in result register
         self.emit_ins(X86Instruction::lea(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_SCRATCH, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult)))));
@@ -1636,7 +1895,16 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_MAP[0], RSP, Some(X86IndirectAccess::OffsetIndexShift(-16, RSP, 0)))); // host_target_address += self.result.text_section;
         // Restore the clobbered REGISTER_MAP[0]
         self.emit_ins(X86Instruction::pop(REGISTER_MAP[0]));
+        #[cfg(not(feature = "jit-enable-host-stack-frames"))]
         self.emit_ins(X86Instruction::jump_reg(RSP, Some(X86IndirectAccess::OffsetIndexShift(-24, RSP, 0)))); // Tail call to host_target_address
+        #[cfg(feature = "jit-enable-host-stack-frames")]
+        {
+            // Internal calls enter here, including callx targets absent from the function registry.
+            // Keeping the frame outside guest code also lets branches cross function labels.
+            self.set_anchor(ANCHOR_HOST_STACK_FRAME);
+            self.emit_host_stack_frame_prologue();
+            self.emit_ins(X86Instruction::jump_reg(RSP, Some(X86IndirectAccess::OffsetIndexShift(-16, RSP, 0))));
+        }
 
         // Translates a vm memory address to a host memory address
         let lower_key = self.immediate_value_key as i32 as i64;
@@ -1647,6 +1915,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         ] {
             let target_offset = *anchor_base + len.trailing_zeros() as usize;
             self.set_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset);
+            self.emit_host_stack_frame_prologue();
             // skip over the pc slot pushed by the caller, we'll pop it before returning
             self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8, None)); // RSP -= 8
             // call MemoryMapping::(load|store) storing the result in RuntimeEnvironmentSlot::ProgramResult
@@ -1658,7 +1927,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     8 => MemoryMapping::load::<u64> as *const u8 as i64,
                     _ => unreachable!()
                 };
-                self.emit_rust_call(Value::Constant64(load, false), &[
+                self.emit_rust_call_with_host_stack_frame(Value::Constant64(load, false), &[
                     Argument { index: 2, value: Value::Register(REGISTER_SCRATCH) }, // Specify first as the src register could be overwritten by other arguments
                     Argument { index: 3, value: Value::Constant64(0, false) }, // self.pc is set later
                     Argument { index: 1, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping), false) },
@@ -1667,7 +1936,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             } else { // AccessType::Store
                 if *anchor_base == 8 {
                     // Second half of emit_sanitized_load_immediate(stack_slot_of_value_to_store, constant)
-                    self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, lower_key, Some(X86IndirectAccess::OffsetIndexShift(-80, RSP, 0))));
+                    self.emit_ins(X86Instruction::alu_immediate(
+                        OperandSize::S64,
+                        0x81,
+                        0,
+                        RSP,
+                        lower_key,
+                        Some(X86IndirectAccess::OffsetIndexShift(
+                            ADDRESS_TRANSLATION_VALUE_SLOT_OFFSET_PRE_CALL,
+                            RSP,
+                            0,
+                        )),
+                    ));
                 }
                 let store = match len {
                     1 => MemoryMapping::store::<u8> as *const u8 as i64,
@@ -1676,7 +1956,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     8 => MemoryMapping::store::<u64> as *const u8 as i64,
                     _ => unreachable!()
                 };
-                self.emit_rust_call(Value::Constant64(store, false), &[
+                self.emit_rust_call_with_host_stack_frame(Value::Constant64(store, false), &[
                     Argument { index: 3, value: Value::Register(REGISTER_SCRATCH) }, // Specify first as the src register could be overwritten by other arguments
                     Argument { index: 2, value: Value::RegisterIndirect(RSP, -8, false) },
                     Argument { index: 4, value: Value::Constant64(0, false) }, // self.pc is set later
@@ -1688,6 +1968,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             // Throw error if the result indicates one
             self.emit_result_is_err(REGISTER_SCRATCH);
             self.emit_ins(X86Instruction::pop(REGISTER_SCRATCH)); // REGISTER_SCRATCH = pc
+            #[cfg(feature = "jit-enable-host-stack-frames")]
+            self.emit_ins(X86Instruction::pop(RBP));
             self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6)));
 
             if *anchor_base == 0 { // AccessType::Load
@@ -1697,10 +1979,39 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
             self.emit_ins(X86Instruction::return_near());
         }
+
+        #[cfg(feature = "jit-enable-host-stack-frames")]
+        {
+            self.set_anchor(ANCHOR_ENTRYPOINT);
+            self.result.host_stack_frame_entry = self.offset_in_text_section;
+            self.emit_host_stack_frame_prologue();
+            if !self.program.is_empty() {
+                let offset = self.relative_to_target_pc(self.executable.get_entrypoint_instruction_offset(), 5);
+                self.emit_ins(X86Instruction::jump_immediate(offset));
+            }
+        }
+        self.finish_anchor_ranges();
     }
 
     fn set_anchor(&mut self, anchor: usize) {
+        if let Some(previous) = self.last_anchor {
+            if self.anchor_ranges[previous].end == AnchorRange::UNSET {
+                self.anchor_ranges[previous].end = self.offset_in_text_section;
+            }
+        }
+        if self.anchor_ranges[anchor].start == AnchorRange::UNSET {
+            self.anchor_ranges[anchor].start = self.offset_in_text_section;
+        }
         self.anchors[anchor] = unsafe { self.result.text_section.as_ptr().add(self.offset_in_text_section) };
+        self.last_anchor = Some(anchor);
+    }
+
+    fn finish_anchor_ranges(&mut self) {
+        if let Some(last) = self.last_anchor {
+            if self.anchor_ranges[last].end == AnchorRange::UNSET {
+                self.anchor_ranges[last].end = self.offset_in_text_section;
+            }
+        }
     }
 
     // instruction_length = 5 (Unconditional jump / call)

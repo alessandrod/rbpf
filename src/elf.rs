@@ -304,6 +304,8 @@ pub struct Executable<C: ContextObject> {
     function_registry: FunctionRegistry<usize>,
     /// Loader built-in program
     loader: Arc<BuiltinProgram<C>>,
+    /// Optional program identifier for debug output
+    program_id: Option<String>,
     /// Compiled program and argument
     #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
     compiled_program: std::sync::Mutex<Option<Arc<JitProgram>>>,
@@ -398,6 +400,19 @@ impl<C: ContextObject> Executable<C> {
     /// Get the loader built-in program
     pub fn get_loader(&self) -> &Arc<BuiltinProgram<C>> {
         &self.loader
+    }
+
+    /// Set the program identifier used by debuggers and profilers.
+    ///
+    /// This also names the entrypoint in GDB and jitdump output. Set it before
+    /// calling `jit_compile`; existing compiled programs retain their debug names.
+    pub fn set_program_id(&mut self, program_id: impl Into<String>) {
+        self.program_id = Some(program_id.into());
+    }
+
+    /// Get the program identifier used by debuggers and profilers
+    pub fn get_program_id(&self) -> Option<&str> {
+        self.program_id.as_deref()
     }
 
     /// Get the JIT compiled program
@@ -500,6 +515,7 @@ impl<C: ContextObject> Executable<C> {
             entry_pc,
             function_registry,
             loader,
+            program_id: None,
             #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
             compiled_program: None.into(),
         })
@@ -656,6 +672,7 @@ impl<C: ContextObject> Executable<C> {
             entry_pc,
             function_registry,
             loader,
+            program_id: None,
             #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
             compiled_program: None.into(),
         })
@@ -830,6 +847,7 @@ impl<C: ContextObject> Executable<C> {
             entry_pc,
             function_registry,
             loader,
+            program_id: None,
             #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
             compiled_program: None.into(),
         })

@@ -71,6 +71,9 @@ struct X86Sib {
 
 #[derive(Copy, Clone)]
 pub enum X86IndirectAccess {
+    /// [RIP of the next instruction + offset]; ignores the base register
+    #[cfg(feature = "jit-enable-host-stack-frames")]
+    RipRelative(i32),
     /// [second_operand + offset]
     Offset(i32),
     /// [second_operand + offset + index << shift]
@@ -137,6 +140,13 @@ impl X86Instruction {
         let mut displacement = 0;
         if self.modrm {
             match self.indirect {
+                #[cfg(feature = "jit-enable-host-stack-frames")]
+                Some(X86IndirectAccess::RipRelative(offset)) => {
+                    displacement = offset;
+                    displacement_size = OperandSize::S32;
+                    modrm.m = 5;
+                    rex.b = false;
+                }
                 Some(X86IndirectAccess::Offset(offset)) => {
                     displacement = offset;
                     debug_assert_ne!(self.second_operand & 0b111, 4); // Reserved for SIB addressing

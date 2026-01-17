@@ -9,6 +9,12 @@
 extern crate solana_sbpf;
 extern crate test;
 
+#[cfg(all(
+    feature = "jit-dump",
+    not(target_os = "windows"),
+    target_arch = "x86_64"
+))]
+use solana_sbpf::assembler::assemble;
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
 use solana_sbpf::{ebpf, memory_region::MemoryRegion, program::SBPFVersion};
 use solana_sbpf::{
@@ -142,6 +148,92 @@ fn bench_jit_vs_interpreter(
         "jit_vs_interpreter_ratio={}",
         interpreter_summary.mean / jit_summary.mean
     );
+}
+
+#[cfg(all(
+    feature = "jit-dump",
+    not(target_os = "windows"),
+    target_arch = "x86_64"
+))]
+#[bench]
+fn bench_jit_dump_functions(bencher: &mut Bencher) {
+    let assembly = r#"
+        entrypoint:
+        mov r6, r1
+        call function_mix
+        call function_checksum
+        call function_branchy
+        mov r0, 0
+        exit
+
+        function_mix:
+        mov r2, 30000
+        loop_mix:
+        mov r0, r2
+        xor r0, r6
+        add r0, 0x1234
+        lsh r0, 3
+        rsh r0, 1
+        add r2, -1
+        jgt r2, 0, loop_mix
+        call function_branchy
+        exit
+
+        function_checksum:
+        mov r2, 30000
+        loop_checksum:
+        ldxb r0, [r6+0]
+        ldxb r3, [r6+1]
+        add r0, r3
+        add r2, -1
+        jgt r2, 0, loop_checksum
+        exit
+
+        function_branchy:
+        mov r2, 30000
+        loop_branchy:
+        mov r0, r2
+        and r0, 7
+        jgt r0, 3, branch_done
+        add r0, 1
+        branch_done:
+        add r2, -1
+        jgt r2, 0, loop_branchy
+        exit
+    "#;
+
+    let config = Config {
+        enable_instruction_meter: false,
+        noop_instruction_rate: 0,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    let executable =
+        assemble::<TestContextObject>(assembly, Arc::new(BuiltinProgram::new_loader(config)))
+            .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    executable.jit_compile().unwrap();
+
+    let mut context_object = TestContextObject::default();
+    let mut input = [0u8; 64];
+    for (index, value) in input.iter_mut().enumerate() {
+        *value = index as u8;
+    }
+    let mem_region = MemoryRegion::new(&raw mut input, ebpf::MM_INPUT_START);
+    create_vm!(
+        vm,
+        &executable,
+        &mut context_object,
+        stack,
+        heap,
+        vec![mem_region],
+        None
+    );
+    bencher.iter(|| {
+        vm.execute_program(&executable, &mut ExecutionMode::Jit, &mut [])
+            .1
+            .unwrap();
+    });
 }
 
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]

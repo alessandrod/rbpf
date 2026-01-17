@@ -2116,6 +2116,48 @@ fn test_callx() {
 }
 
 #[test]
+fn test_callx_without_function_label() {
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        mov64 r8, 1
+        lsh64 r8, 32
+        or64 r8, 48
+        callx r8
+        exit
+        add64 r10, 0
+        mov64 r0, 42
+        exit",
+        NO_INPUT,
+        TestContextObject::new(9),
+        ProgramResult::Ok(42),
+    );
+}
+
+#[test]
+fn test_branches_across_function_labels() {
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        mov64 r0, 0
+        call function_loop
+        exit
+        function_loop:
+        add64 r10, 0
+        add64 r0, 1
+        function_end:
+        jne r0, 3, function_loop
+        ja function_return
+        mov64 r0, 0
+        function_return:
+        exit",
+        NO_INPUT,
+        TestContextObject::new(15),
+        ProgramResult::Ok(3),
+    );
+}
+
+#[test]
 fn test_err_callx_oob_low() {
     let config = Config {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
@@ -2372,6 +2414,68 @@ fn test_call_memfrob() {
         TestContextObject::new(8),
         ProgramResult::Ok(0x102292e2f2c0708),
     );
+}
+
+#[unsafe(naked)]
+extern "C" fn host_stack_alignment() -> u64 {
+    std::arch::naked_asm!("mov rax, rsp", "and rax, 15", "ret");
+}
+
+declare_builtin_function!(
+    /// Checks the native calling convention independently of the Rust prologue.
+    SyscallHostStackAlignment,
+    fn rust(
+        _context_object: &mut TestContextObject,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        Ok(host_stack_alignment())
+    }
+);
+
+#[test]
+fn test_syscall_stack_alignment_at_nested_call_depths() {
+    for (depth, indirect) in (0..4).flat_map(|depth| [(depth, false), (depth, true)]) {
+        let instructions_per_call = if indirect { 9 } else { 6 };
+        let mut source = String::new();
+        for index in 0..depth {
+            source.push_str("add64 r10, 0\n");
+            if indirect {
+                let target_offset = (index + 1) * instructions_per_call * ebpf::INSN_SIZE as u64;
+                source.push_str(&format!(
+                    "mov64 r8, 1\nlsh64 r8, 32\nor64 r8, {target_offset}\ncallx r8\n"
+                ));
+            } else {
+                source.push_str(&format!("call function_{index}\n"));
+            }
+            // Include a syscall after each return to check that padding is also removed.
+            source.push_str("mov r6, r0\nsyscall stack_alignment\nadd r0, r6\nexit\n");
+            if !indirect {
+                source.push_str(&format!("function_{index}:\n"));
+            }
+        }
+        source.push_str("add64 r10, 0\nsyscall stack_alignment\nexit");
+        for sbpf_version in [SBPFVersion::V0, SBPFVersion::V3] {
+            for enable_register_tracing in [false, true] {
+                let mut loader = BuiltinProgram::new_loader(Config {
+                    enabled_sbpf_versions: sbpf_version..=sbpf_version,
+                    enable_register_tracing,
+                    ..Config::default()
+                });
+                SyscallHostStackAlignment::register(&mut loader, "stack_alignment").unwrap();
+                let executable = assemble(&source, Arc::new(loader)).unwrap();
+                test_interpreter_and_jit!(
+                    executable,
+                    NO_INPUT,
+                    TestContextObject::new(instructions_per_call * depth + 3),
+                    ProgramResult::Ok(8 * (depth + 1)),
+                );
+            }
+        }
+    }
 }
 
 declare_builtin_function!(
@@ -3414,6 +3518,17 @@ fn test_lddw() {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
         ..Config::default()
     };
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        call 1
+        lddw r0, 0x1122334455667788
+        exit",
+        config.clone(),
+        NO_INPUT,
+        TestContextObject::new(3),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
+    );
     test_interpreter_and_jit_asm!(
         "
         add64 r10, 0
